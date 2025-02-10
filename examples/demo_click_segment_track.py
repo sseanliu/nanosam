@@ -31,9 +31,12 @@ latestFrame = None
 latestFrameLock = threading.Lock()
 RUNNING = True
 
-# --- ADDED: a global state to track if we are currently updating
+# (1) Two new rate-limit variables
 updateInProgress = False
-lastImagePil = None  # we store the last PIL image used for update
+lastUpdateTime = 0.0
+updateInterval = 0.5  # e.g., update tracker at most every 0.5s
+
+lastImagePil = None  # stores the last PIL image used for the worker
 
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
@@ -133,21 +136,26 @@ def server_thread(host, port):
 def handle_frame(frame_bgr):
     """
     We'll just do the overlay portion in the main thread.
-    The actual 'tracker.update(...)' is moved to a separate worker if not already running.
+    'tracker.update(...)' is called in a separate thread, but also rate-limited
+    so we do not saturate the GPU frequently.
     """
-    global mask, point, image_pil, updateInProgress, lastImagePil
+    global mask, point, image_pil
+    global updateInProgress, lastUpdateTime, updateInterval
+    global lastImagePil
+
     image_pil = cv2_to_pil(frame_bgr)
 
-    # If we have a valid tracker.token, let's do an async update
-    if tracker.token is not None and not updateInProgress:
+    # (2) Rate-limiting check + concurrency check
+    now = time.time()
+    if tracker.token is not None and not updateInProgress and (now - lastUpdateTime) > updateInterval:
         # store the current PIL for the worker
         lastImagePil = image_pil
-        # spawn a thread to run update
         updateInProgress = True
+        lastUpdateTime = now  # mark time we started an update
         t = threading.Thread(target=tracker_update_worker, daemon=True)
         t.start()
 
-    # do overlay with the existing 'mask'
+    # overlay with the existing mask
     disp = frame_bgr.copy()
     if mask is not None:
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
@@ -169,8 +177,8 @@ def handle_frame(frame_bgr):
 
 def tracker_update_worker():
     """
-    A short-lived thread that calls 'tracker.update(...)' with the last PIL image,
-    then updates global 'mask' and 'point' once done, and sets 'updateInProgress = False'
+    A short-lived thread that calls 'tracker.update(lastImagePil)'
+    once done, updates global mask + point, sets 'updateInProgress=false'
     """
     global updateInProgress, mask, point, lastImagePil
     print("[TrackerThread] Starting update...")
