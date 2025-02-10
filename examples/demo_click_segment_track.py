@@ -18,9 +18,9 @@ parser.add_argument("--port", type=int, default=12345, help="Listen Port")
 args = parser.parse_args()
 
 def cv2_to_pil(image_bgr):
-    # BGR -> RGB -> PIL
     return PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
+# ========== NanoSAM objects ==========
 predictor = Predictor(args.image_encoder, args.mask_decoder)
 tracker = Tracker(predictor)
 
@@ -33,6 +33,10 @@ latestFrame = None
 latestFrameLock = threading.Lock()
 
 RUNNING = True  # for a clean exit
+
+# Add a "lastUpdateTime" so we skip frequent calls to tracker.update
+lastUpdateTime = 0.0
+updateInterval = 0.2  # e.g., only do tracker.update at most 5 times/sec
 
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
@@ -48,10 +52,6 @@ cv2.namedWindow('mask')
 cv2.setMouseCallback('image', init_track)
 
 def server_thread(host, port):
-    """
-    Minimal TCP server that receives frames from Vision Pro, decodes them, 
-    and stores in `latestFrame`. Then returns mask if any.
-    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((host, port))
@@ -139,12 +139,22 @@ def server_thread(host, port):
     print("Server closed...")
 
 def handle_frame(frame_bgr):
-    global mask, point, image_pil
+    """
+    Here we do mask and overlay drawing. But we skip calling tracker.update()
+    if not enough time has passed since the last call.
+    """
+    global mask, point, image_pil, lastUpdateTime
+
+    # Convert
     image_pil = cv2_to_pil(frame_bgr)
-    if tracker.token is not None:
+
+    # Rate-limit the call to tracker.update
+    now = time.time()
+    if tracker.token is not None and (now - lastUpdateTime) > updateInterval:
         print("[Tracker] updating on new frame...")
         mask, point = tracker.update(image_pil)
         print("[Tracker] done update")
+        lastUpdateTime = now
 
     disp = frame_bgr.copy()
     if mask is not None:
@@ -167,14 +177,12 @@ def handle_frame(frame_bgr):
 
 def main():
     global RUNNING
-    # important to declare if we reassign in main
     global latestFrame
 
     t = threading.Thread(target=server_thread, args=(args.host, args.port), daemon=True)
     t.start()
 
     while True:
-        # allow UI to respond
         ret = cv2.waitKey(30)
         if ret == ord('q'):
             RUNNING = False
@@ -184,7 +192,6 @@ def main():
             print("Tracker reset")
 
         frame_to_process = None
-        # only process the "latest" one once per loop
         with latestFrameLock:
             if latestFrame is not None:
                 frame_to_process = latestFrame.copy()
