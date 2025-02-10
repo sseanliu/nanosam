@@ -20,7 +20,6 @@ args = parser.parse_args()
 def cv2_to_pil(image_bgr):
     return PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
-# ========== NanoSAM objects ==========
 predictor = Predictor(args.image_encoder, args.mask_decoder)
 tracker = Tracker(predictor)
 
@@ -28,15 +27,13 @@ mask = None
 point = None
 image_pil = None
 
-# We'll keep only the LATEST frame from the device
 latestFrame = None
 latestFrameLock = threading.Lock()
+RUNNING = True
 
-RUNNING = True  # for a clean exit
-
-# Add a "lastUpdateTime" so we skip frequent calls to tracker.update
-lastUpdateTime = 0.0
-updateInterval = 0.2  # e.g., only do tracker.update at most 5 times/sec
+# --- ADDED: a global state to track if we are currently updating
+updateInProgress = False
+lastImagePil = None  # we store the last PIL image used for update
 
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
@@ -71,7 +68,6 @@ def server_thread(host, port):
                 continue
 
         try:
-            # 1) read length
             length_data = conn.recv(4)
             if not length_data or len(length_data) < 4:
                 print("Client disconnected or no length data.")
@@ -84,7 +80,6 @@ def server_thread(host, port):
                 print("Invalid length:", length)
                 continue
 
-            # 2) read JPEG
             jpeg_bytes = b''
             to_read = length
             while to_read > 0:
@@ -99,13 +94,11 @@ def server_thread(host, port):
                 conn = None
                 continue
 
-            # decode
             frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
                 print("Failed to decode.")
                 continue
 
-            # store as latest
             with latestFrameLock:
                 global latestFrame
                 latestFrame = frame
@@ -113,7 +106,7 @@ def server_thread(host, port):
             # produce mask
             out_mask_data = b''
             if mask is not None:
-                bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8) * 255
+                bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
                 ret, png_data = cv2.imencode('.png', bin_mask)
                 if ret:
                     out_mask_data = png_data.tobytes()
@@ -125,7 +118,6 @@ def server_thread(host, port):
                 conn.sendall(out_mask_data)
 
         except socket.timeout:
-            # no data
             continue
         except Exception as e:
             print("Server error:", e)
@@ -140,22 +132,22 @@ def server_thread(host, port):
 
 def handle_frame(frame_bgr):
     """
-    Here we do mask and overlay drawing. But we skip calling tracker.update()
-    if not enough time has passed since the last call.
+    We'll just do the overlay portion in the main thread.
+    The actual 'tracker.update(...)' is moved to a separate worker if not already running.
     """
-    global mask, point, image_pil, lastUpdateTime
-
-    # Convert
+    global mask, point, image_pil, updateInProgress, lastImagePil
     image_pil = cv2_to_pil(frame_bgr)
 
-    # Rate-limit the call to tracker.update
-    now = time.time()
-    if tracker.token is not None and (now - lastUpdateTime) > updateInterval:
-        print("[Tracker] updating on new frame...")
-        mask, point = tracker.update(image_pil)
-        print("[Tracker] done update")
-        lastUpdateTime = now
+    # If we have a valid tracker.token, let's do an async update
+    if tracker.token is not None and not updateInProgress:
+        # store the current PIL for the worker
+        lastImagePil = image_pil
+        # spawn a thread to run update
+        updateInProgress = True
+        t = threading.Thread(target=tracker_update_worker, daemon=True)
+        t.start()
 
+    # do overlay with the existing 'mask'
     disp = frame_bgr.copy()
     if mask is not None:
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
@@ -174,6 +166,23 @@ def handle_frame(frame_bgr):
         cv2.circle(disp, point, 5, (0,185,118), -1)
 
     cv2.imshow("image", disp)
+
+def tracker_update_worker():
+    """
+    A short-lived thread that calls 'tracker.update(...)' with the last PIL image,
+    then updates global 'mask' and 'point' once done, and sets 'updateInProgress = False'
+    """
+    global updateInProgress, mask, point, lastImagePil
+    print("[TrackerThread] Starting update...")
+    try:
+        new_mask, new_point = tracker.update(lastImagePil)
+        if new_mask is not None:
+            mask = new_mask
+            point = new_point
+    except Exception as e:
+        print("[TrackerThread] error:", e)
+    updateInProgress = False
+    print("[TrackerThread] Done update.")
 
 def main():
     global RUNNING
