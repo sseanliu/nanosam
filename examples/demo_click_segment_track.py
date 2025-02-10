@@ -18,6 +18,7 @@ parser.add_argument("--port", type=int, default=12345, help="Listen Port")
 args = parser.parse_args()
 
 def cv2_to_pil(image_bgr):
+    # BGR -> RGB -> PIL
     return PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
 predictor = Predictor(args.image_encoder, args.mask_decoder)
@@ -27,11 +28,11 @@ mask = None
 point = None
 image_pil = None
 
-# We'll keep only the latestFrame; if new frames arrive faster than we handle them, we discard older ones
+# We'll keep only the LATEST frame from the device
 latestFrame = None
 latestFrameLock = threading.Lock()
 
-RUNNING = True
+RUNNING = True  # for a clean exit
 
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
@@ -47,6 +48,10 @@ cv2.namedWindow('mask')
 cv2.setMouseCallback('image', init_track)
 
 def server_thread(host, port):
+    """
+    Minimal TCP server that receives frames from Vision Pro, decodes them, 
+    and stores in `latestFrame`. Then returns mask if any.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((host, port))
@@ -66,9 +71,9 @@ def server_thread(host, port):
                 continue
 
         try:
-            # read length
+            # 1) read length
             length_data = conn.recv(4)
-            if not length_data or len(length_data)<4:
+            if not length_data or len(length_data) < 4:
                 print("Client disconnected or no length data.")
                 conn.close()
                 conn = None
@@ -79,16 +84,16 @@ def server_thread(host, port):
                 print("Invalid length:", length)
                 continue
 
-            # read the JPEG data
+            # 2) read JPEG
             jpeg_bytes = b''
             to_read = length
-            while to_read>0:
+            while to_read > 0:
                 chunk = conn.recv(to_read)
                 if not chunk:
                     break
                 jpeg_bytes += chunk
                 to_read -= len(chunk)
-            if len(jpeg_bytes)<length:
+            if len(jpeg_bytes) < length:
                 print("Client disconnected mid-frame.")
                 conn.close()
                 conn = None
@@ -100,15 +105,15 @@ def server_thread(host, port):
                 print("Failed to decode.")
                 continue
 
-            # Overwrite the global 'latestFrame'
+            # store as latest
             with latestFrameLock:
                 global latestFrame
                 latestFrame = frame
 
-            # Return mask
+            # produce mask
             out_mask_data = b''
             if mask is not None:
-                bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
+                bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8) * 255
                 ret, png_data = cv2.imencode('.png', bin_mask)
                 if ret:
                     out_mask_data = png_data.tobytes()
@@ -116,7 +121,7 @@ def server_thread(host, port):
             mask_len = len(out_mask_data)
             send_len = struct.pack('<i', mask_len)
             conn.sendall(send_len)
-            if mask_len>0:
+            if mask_len > 0:
                 conn.sendall(out_mask_data)
 
         except socket.timeout:
@@ -137,10 +142,10 @@ def handle_frame(frame_bgr):
     global mask, point, image_pil
     image_pil = cv2_to_pil(frame_bgr)
     if tracker.token is not None:
-        # This can be slow => might cause backlog if we did not skip frames
+        print("[Tracker] updating on new frame...")
         mask, point = tracker.update(image_pil)
+        print("[Tracker] done update")
 
-    # draw
     disp = frame_bgr.copy()
     if mask is not None:
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
@@ -161,13 +166,17 @@ def handle_frame(frame_bgr):
     cv2.imshow("image", disp)
 
 def main():
+    global RUNNING
+    # important to declare if we reassign in main
+    global latestFrame
+
     t = threading.Thread(target=server_thread, args=(args.host, args.port), daemon=True)
     t.start()
 
     while True:
+        # allow UI to respond
         ret = cv2.waitKey(30)
         if ret == ord('q'):
-            global RUNNING
             RUNNING = False
             break
         elif ret == ord('r'):
@@ -175,11 +184,11 @@ def main():
             print("Tracker reset")
 
         frame_to_process = None
+        # only process the "latest" one once per loop
         with latestFrameLock:
             if latestFrame is not None:
-                # copy the newest frame
                 frame_to_process = latestFrame.copy()
-                latestFrame = None  # Optionally set to None to skip older frames
+                latestFrame = None
 
         if frame_to_process is not None:
             handle_frame(frame_to_process)
