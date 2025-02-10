@@ -50,6 +50,7 @@ def init_track(event,x,y,flags,param):
 
 
 cv2.namedWindow('image')
+cv2.namedWindow('mask')
 cv2.setMouseCallback('image',init_track)
 
 while True:
@@ -71,6 +72,10 @@ while True:
         green_image = np.zeros_like(image)
         green_image[:, :] = (0, 185, 118)
         green_image[bin_mask] = 0
+
+        mask_display = np.zeros_like(image)
+        mask_display[bin_mask] = (255, 255, 255)
+        cv2.imshow("mask", mask_display)
 
         image = cv2.addWeighted(image, 0.4, green_image, 0.6, 0)
 

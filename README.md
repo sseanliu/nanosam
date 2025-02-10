@@ -184,8 +184,8 @@ NanoSAM is fairly easy to get started with.
 5. Run the basic usage example
 
     ```
-    python3 examples/basic_usage.py \
-        --image_encoder=data/resnet18_image_encoder.engine \
+    python examples/basic_usage.py `
+        --image_encoder=data/resnet18_image_encoder.engine `
         --mask_decoder=data/mobile_sam_mask_decoder.engine
     ```
 
