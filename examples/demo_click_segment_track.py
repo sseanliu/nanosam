@@ -18,10 +18,8 @@ parser.add_argument("--port", type=int, default=12345, help="Listen Port")
 args = parser.parse_args()
 
 def cv2_to_pil(image_bgr):
-    image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    return PIL.Image.fromarray(image)
+    return PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
-# ========== NanoSAM objects ==========
 predictor = Predictor(args.image_encoder, args.mask_decoder)
 tracker = Tracker(predictor)
 
@@ -29,92 +27,85 @@ mask = None
 point = None
 image_pil = None
 
-# ========== Global for the latest BGR frame ==========
+# We'll keep only the latestFrame; if new frames arrive faster than we handle them, we discard older ones
 latestFrame = None
 latestFrameLock = threading.Lock()
+
+RUNNING = True
 
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
     if event == cv2.EVENT_LBUTTONDBLCLK:
         if image_pil is not None:
-            print("Double-click: init track at:", (x, y))
+            print("[DoubleClick] init track at:", (x, y))
             mask = tracker.init(image_pil, point=(x, y))
             point = (x, y)
-            print("Init track done.")
+            print("[DoubleClick] track init done.")
 
 cv2.namedWindow('image')
 cv2.namedWindow('mask')
 cv2.setMouseCallback('image', init_track)
 
 def server_thread(host, port):
-    """
-    Minimal TCP server that receives frames from Vision Pro,
-    decodes JPEG -> BGR, stores them in `latestFrame`,
-    and returns mask if available.
-    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((host, port))
     s.listen(1)
     print(f"NanoSAM server listening at {host}:{port}")
 
-    s.settimeout(0.5)  # allow check for stopping
+    s.settimeout(0.5)
     conn = None
 
-    while True:
+    while RUNNING:
         if not conn:
             try:
                 conn, addr = s.accept()
-                conn.settimeout(0.1)  # non-blocking-ish socket
+                conn.settimeout(0.1)
                 print("Got connection from", addr)
             except socket.timeout:
-                # no new connection, keep looping
-                if not RUNNING:
-                    break
                 continue
 
-        # If we have a connection, read frames
         try:
-            # Step 1) read length
+            # read length
             length_data = conn.recv(4)
-            if not length_data or len(length_data) < 4:
+            if not length_data or len(length_data)<4:
                 print("Client disconnected or no length data.")
                 conn.close()
                 conn = None
                 continue
+
             (length,) = struct.unpack('<i', length_data)
-            length = int(length)
             if length <= 0:
                 print("Invalid length:", length)
                 continue
 
-            # Step 2) read JPEG data
+            # read the JPEG data
             jpeg_bytes = b''
             to_read = length
-            while to_read > 0:
+            while to_read>0:
                 chunk = conn.recv(to_read)
                 if not chunk:
                     break
                 jpeg_bytes += chunk
                 to_read -= len(chunk)
-            if len(jpeg_bytes) < length:
+            if len(jpeg_bytes)<length:
                 print("Client disconnected mid-frame.")
                 conn.close()
                 conn = None
                 continue
 
             # decode
-            nparr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
-                print("Failed to decode JPEG.")
+                print("Failed to decode.")
                 continue
 
+            # Overwrite the global 'latestFrame'
             with latestFrameLock:
                 global latestFrame
                 latestFrame = frame
 
-            # produce mask
+            # Return mask
             out_mask_data = b''
             if mask is not None:
                 bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
@@ -125,65 +116,58 @@ def server_thread(host, port):
             mask_len = len(out_mask_data)
             send_len = struct.pack('<i', mask_len)
             conn.sendall(send_len)
-            if mask_len > 0:
+            if mask_len>0:
                 conn.sendall(out_mask_data)
 
         except socket.timeout:
-            # No data available right now, it's normal in non-blocking mode
-            if not RUNNING:
-                break
+            # no data
             continue
         except Exception as e:
-            print("Server thread error:", e)
-            if conn:
-                conn.close()
+            print("Server error:", e)
+            conn.close()
             conn = None
             continue
 
     if conn:
         conn.close()
     s.close()
-    print("Server closed.")
+    print("Server closed...")
 
 def handle_frame(frame_bgr):
     global mask, point, image_pil
     image_pil = cv2_to_pil(frame_bgr)
-
     if tracker.token is not None:
-        print("Updating tracker...")
+        # This can be slow => might cause backlog if we did not skip frames
         mask, point = tracker.update(image_pil)
-        print("Tracker update done.")
 
     # draw
-    display_frame = frame_bgr.copy()
+    disp = frame_bgr.copy()
     if mask is not None:
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
-        green_image = np.zeros_like(display_frame)
-        green_image[:] = (0, 185, 118)
-        green_image[~bin_mask] = 0
+        green = np.zeros_like(disp)
+        green[:] = (0,185,118)
+        green[~bin_mask] = 0
 
-        mask_display = np.zeros_like(display_frame)
-        mask_display[bin_mask] = (255, 255, 255)
-        cv2.imshow("mask", mask_display)
+        mask_disp = np.zeros_like(disp)
+        mask_disp[bin_mask] = (255,255,255)
+        cv2.imshow("mask", mask_disp)
 
-        alpha = 0.6
-        display_frame = cv2.addWeighted(display_frame, 1-alpha, green_image, alpha, 0)
+        alpha=0.6
+        disp = cv2.addWeighted(disp, 1-alpha, green, alpha, 0)
 
     if point is not None:
-        cv2.circle(display_frame, point, 5, (0,185,118), -1)
+        cv2.circle(disp, point, 5, (0,185,118), -1)
 
-    cv2.imshow("image", display_frame)
-
-RUNNING = True
+    cv2.imshow("image", disp)
 
 def main():
-    global RUNNING
     t = threading.Thread(target=server_thread, args=(args.host, args.port), daemon=True)
     t.start()
 
     while True:
         ret = cv2.waitKey(30)
         if ret == ord('q'):
+            global RUNNING
             RUNNING = False
             break
         elif ret == ord('r'):
@@ -193,7 +177,9 @@ def main():
         frame_to_process = None
         with latestFrameLock:
             if latestFrame is not None:
+                # copy the newest frame
                 frame_to_process = latestFrame.copy()
+                latestFrame = None  # Optionally set to None to skip older frames
 
         if frame_to_process is not None:
             handle_frame(frame_to_process)
@@ -201,5 +187,5 @@ def main():
     cv2.destroyAllWindows()
     print("Exiting main...")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
