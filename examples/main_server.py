@@ -19,32 +19,33 @@ parser.add_argument("--child_host", type=str, default="127.0.0.1", help="child G
 parser.add_argument("--child_port", type=int, default=55555, help="child GPU server port")
 args = parser.parse_args()
 
+# These hold the current overlay mask and point
 mask = None
 point = None
 
+# We store the latest frame from VisionPro
 latestFrame = None
 latestFrameLock = threading.Lock()
 RUNNING = True
 
-childProc = None   # The separate GPU process
+# Reference to the separate GPU process
+childProc = None
 
+# We'll build an absolute path for child_infer_server.py
 scriptDir = os.path.dirname(os.path.abspath(__file__))
 childInferServerPath = os.path.join(scriptDir, "child_infer_server.py")
-
 
 def spawn_child_infer_server():
     global childProc
     if childProc is not None:
+        # already running
         return
-    # We'll pass environment variables so child can load the correct engine
     env = os.environ.copy()
     env["ENCODER_PATH"] = args.image_encoder
     env["DECODER_PATH"] = args.mask_decoder
 
-    # spawn
     childProc = subprocess.Popen(["python", childInferServerPath], env=env)
     print("[Main] Spawned child_infer_server process, loaded model once.")
-
 
 def kill_child_infer_server():
     global childProc
@@ -53,47 +54,55 @@ def kill_child_infer_server():
         childProc.terminate()
         childProc = None
 
+def ensure_child_is_running():
+    """
+    If we've previously killed the child or it has exited,
+    spawn a fresh one so we don't get timeouts on commands.
+    """
+    global childProc
+    if childProc is None or (childProc.poll() is not None):
+        print("[Main] Child not running or ended. Spawning again.")
+        spawn_child_infer_server()
+        # Optionally sleep a bit to let it start listening
+        time.sleep(0.5)
 
 def send_command_to_child(cmd_str):
     """
     Sends a command string to the child server, returns the mask data from child.
-    e.g. cmd_str = "INIT 100 200 frame.jpg"
-    or "UPDATE frame2.jpg"
-    or "RESET"
+    e.g. "INIT 100 200 frame.jpg", "UPDATE frame2.jpg", "RESET", etc.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(1.0)
     try:
         sock.connect((args.child_host, args.child_port))
-        # 1) send length + cmd_str
         cmd_bytes = cmd_str.encode('utf-8')
         header = struct.pack('<i', len(cmd_bytes))
         sock.sendall(header)
         sock.sendall(cmd_bytes)
 
-        # 2) read mask length
+        # read mask length
         length_data = sock.recv(4)
-        if not length_data or len(length_data)<4:
+        if not length_data or len(length_data) < 4:
             print("[Main->Child] incomplete mask length.")
             return None
         (mask_len,) = struct.unpack('<i', length_data)
-        if mask_len<=0:
+        if mask_len <= 0:
             print("[Main->Child] child returned mask_len=0 => no mask.")
             return None
 
-        # 3) read mask bytes
+        # read mask bytes
         mask_bytes = b''
         to_read = mask_len
-        while to_read>0:
+        while to_read > 0:
             chunk = sock.recv(to_read)
             if not chunk:
                 break
             mask_bytes += chunk
             to_read -= len(chunk)
-        if len(mask_bytes)<mask_len:
+
+        if len(mask_bytes) < mask_len:
             print("[Main->Child] partial mask recv => ignoring.")
             return None
-        # decode as grayscale
         mask_np = np.frombuffer(mask_bytes, dtype=np.uint8)
         mask_img = cv2.imdecode(mask_np, cv2.IMREAD_GRAYSCALE)
         return mask_img
@@ -103,16 +112,21 @@ def send_command_to_child(cmd_str):
     finally:
         sock.close()
 
-
 def on_mouse(event, x, y, flags, param):
     global mask, point
+
+    # Left-double-click => send INIT
     if event == cv2.EVENT_LBUTTONDBLCLK:
         print("[DoubleClick] => send INIT to child.")
-        # 1) Save frame
+        # 1) ensure the child server is up
+        ensure_child_is_running()
+
+        # 2) Save frame
         frameCopy = None
         with latestFrameLock:
             if latestFrame is not None:
                 frameCopy = latestFrame.copy()
+
         if frameCopy is None:
             print("[Main] No frame to run child on.")
             return
@@ -120,6 +134,7 @@ def on_mouse(event, x, y, flags, param):
         frame_path = "tmp_input.jpg"
         cv2.imwrite(frame_path, frameCopy)
 
+        # 3) send INIT command
         cmd_str = f"INIT {x} {y} {frame_path}"
         new_mask = send_command_to_child(cmd_str)
         if new_mask is not None:
@@ -127,19 +142,18 @@ def on_mouse(event, x, y, flags, param):
             point = (x, y)
             print("[Main] INIT done. Mask shape:", new_mask.shape)
 
+    # Right-click => forcibly kill child + reset local mask
     elif event == cv2.EVENT_RBUTTONDOWN:
         print("[RightClick] => kill child process + reset mask.")
         kill_child_infer_server()
         mask = None
         point = None
 
-
 cv2.namedWindow("image")
 cv2.namedWindow("mask")
 cv2.setMouseCallback("image", on_mouse)
 
 def server_thread():
-    import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((args.host, args.port))
@@ -156,28 +170,29 @@ def server_thread():
                 print("Got connection from", addr)
             except socket.timeout:
                 continue
+
         try:
             length_data = conn.recv(4)
-            if not length_data or len(length_data)<4:
+            if not length_data or len(length_data) < 4:
                 print("Client disconnected or no length data.")
                 conn.close()
                 conn = None
                 continue
 
             (length,) = struct.unpack('<i', length_data)
-            if length <=0:
+            if length <= 0:
                 print("Invalid length:", length)
                 continue
 
             jpeg_bytes = b''
             to_read = length
-            while to_read>0:
+            while to_read > 0:
                 chunk = conn.recv(to_read)
                 if not chunk:
                     break
                 jpeg_bytes += chunk
                 to_read -= len(chunk)
-            if len(jpeg_bytes)<length:
+            if len(jpeg_bytes) < length:
                 print("Client disconnected mid-frame.")
                 conn.close()
                 conn = None
@@ -191,6 +206,7 @@ def server_thread():
             with latestFrameLock:
                 global latestFrame
                 latestFrame = frame
+
         except socket.timeout:
             continue
         except Exception as e:
@@ -206,14 +222,12 @@ def server_thread():
 
 def main():
     global RUNNING
-    global mask
-    global point
-    global childProc
+    global mask, point, childProc
 
-    # 1) spawn child_infer_server
+    # spawn child once at startup
     spawn_child_infer_server()
 
-    # 2) start local server to receive frames from Vision Pro
+    # start local server to receive frames
     t = threading.Thread(target=server_thread, daemon=True)
     t.start()
 
@@ -223,7 +237,9 @@ def main():
             RUNNING = False
             break
         elif key == ord('r'):
-            # "tracker.reset" => child side
+            # user pressed 'r' => reset the child
+            # first ensure child is up (if we killed it earlier)
+            ensure_child_is_running()
             new_mask = send_command_to_child("RESET")
             if new_mask is not None:
                 print("[Main] after RESET we got a new mask?? ignoring.")
@@ -232,13 +248,13 @@ def main():
             mask = None
             point = None
 
-        # show image
         frameCopy = None
         with latestFrameLock:
             if latestFrame is not None:
                 frameCopy = latestFrame.copy()
+                latestFrame = None
+
         if frameCopy is not None:
-            # overlay local mask if any
             disp = frameCopy.copy()
             if mask is not None:
                 bin_mask = (mask < 128)
