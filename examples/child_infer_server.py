@@ -1,4 +1,5 @@
 # child_infer_server.py
+
 import sys
 import cv2
 import numpy as np
@@ -29,7 +30,6 @@ def load_model_once():
     print("[ChildServer] Model loaded successfully.")
 
 def handle_init(parts, conn):
-    # e.g. parts = ["INIT","200","150","tmp_input.jpg"]
     if len(parts) < 4:
         print("[ChildServer] INIT missing args.")
         send_mask(None, conn)
@@ -54,7 +54,6 @@ def handle_init(parts, conn):
     send_mask(init_mask, conn)
 
 def handle_update(parts, conn):
-    # e.g. parts = ["UPDATE","tmp_input.jpg"]
     if len(parts) < 2:
         print("[ChildServer] UPDATE missing frame path.")
         send_mask(None, conn)
@@ -68,6 +67,7 @@ def handle_update(parts, conn):
         return
 
     image_pil = PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+
     global mask_cache, point_cache
     if tracker.token is None:
         print("[ChildServer] UPDATE but no active track.")
@@ -90,19 +90,21 @@ def handle_reset(parts, conn):
     send_mask(None, conn)
 
 def send_mask(sam_mask, conn):
-    # If None => length=0
+    """Send a PNG mask to the parent. We interpret '>= 0' as object => 255, background => 0."""
     if sam_mask is None:
         hdr = struct.pack('<i', 0)
         conn.sendall(hdr)
         return
 
-    # same approach: <0 => background => we convert object=255, background=0
-    bin_mask = (sam_mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
+    # FIX: Use >= 0 for object => 255. This matches the original highlight logic.
+    bin_mask = (sam_mask[0,0].detach().cpu().numpy() >= 0).astype(np.uint8)*255
+
     ret, png_data = cv2.imencode('.png', bin_mask)
     if not ret:
         hdr = struct.pack('<i', 0)
         conn.sendall(hdr)
         return
+
     mask_bytes = png_data.tobytes()
     hdr = struct.pack('<i', len(mask_bytes))
     conn.sendall(hdr)
