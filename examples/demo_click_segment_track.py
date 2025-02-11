@@ -31,16 +31,16 @@ latestFrame = None
 latestFrameLock = threading.Lock()
 RUNNING = True
 
-# (1) Two new rate-limit variables
+# Rate-limit and concurrency flags
 updateInProgress = False
 lastUpdateTime = 0.0
-updateInterval = 0.5  # e.g., update tracker at most every 0.5s
+updateInterval = 0.5
 
-lastImagePil = None  # stores the last PIL image used for the worker
+lastImagePil = None
 
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
-    # 1) Double-left-click => initialize tracking
+    global updateInProgress, lastUpdateTime
     if event == cv2.EVENT_LBUTTONDBLCLK:
         if image_pil is not None:
             print("[DoubleClick] init track at:", (x, y))
@@ -48,12 +48,19 @@ def init_track(event, x, y, flags, param):
             point = (x, y)
             print("[DoubleClick] track init done.")
 
-    # 2) Right-click => cancel current tracking
     elif event == cv2.EVENT_RBUTTONDOWN:
         print("[RightClick] Cancel tracking.")
+        # 1) Reset the tracker logic
         tracker.reset()
+        # 2) Force the 'token' to None so 'tracker.update' won't run
+        tracker.token = None
+        # 3) Clear mask & point
         mask = None
         point = None
+        # 4) Cancel any concurrency if mid-update
+        updateInProgress = False
+        # 5) Reset lastUpdateTime so next attempt won't be blocked
+        lastUpdateTime = 0
 
 cv2.namedWindow('image')
 cv2.namedWindow('mask')
@@ -114,10 +121,9 @@ def server_thread(host, port):
                 global latestFrame
                 latestFrame = frame
 
-            # produce mask
+            # produce mask to send back
             out_mask_data = b''
             if mask is not None:
-                # same logic as before for sending
                 bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
                 ret, png_data = cv2.imencode('.png', bin_mask)
                 if ret:
@@ -143,12 +149,6 @@ def server_thread(host, port):
     print("Server closed...")
 
 def handle_frame(frame_bgr):
-    """
-    We'll do the overlay portion in the main thread.
-    'tracker.update(...)' is still in a separate thread, rate-limited.
-    The main difference is how we interpret 'bin_mask', 
-    matching the original logic from nanosam's example so it won't be inverted.
-    """
     global mask, point, image_pil
     global updateInProgress, lastUpdateTime, updateInterval
     global lastImagePil
@@ -166,22 +166,16 @@ def handle_frame(frame_bgr):
 
     disp = frame_bgr.copy()
     if mask is not None:
-        # EXACT original approach from sample:
-        # "bin_mask" = background, so object is "not bin_mask"
+        # Original logic
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
 
-        # create a green overlay
         green = np.zeros_like(disp)
-        green[:] = (0, 185, 118)
-
-        # zero out the background region
+        green[:] = (0,185,118)
         green[bin_mask] = 0
 
-        # blend
         disp = cv2.addWeighted(disp, 0.4, green, 0.6, 0)
 
-        # (Optional) If you still want a "mask" window that shows object in white,
-        # we do it with "obj_mask = ~bin_mask"
+        # optional separate window
         obj_mask = np.logical_not(bin_mask)
         mask_disp = np.zeros_like(disp)
         mask_disp[obj_mask] = (255,255,255)
@@ -193,10 +187,6 @@ def handle_frame(frame_bgr):
     cv2.imshow("image", disp)
 
 def tracker_update_worker():
-    """
-    A short-lived thread that calls 'tracker.update(lastImagePil)'
-    once done, updates global mask + point, sets 'updateInProgress=false'
-    """
     global updateInProgress, mask, point, lastImagePil
     print("[TrackerThread] Starting update...")
     try:
@@ -223,6 +213,8 @@ def main():
             break
         elif ret == ord('r'):
             tracker.reset()
+            mask = None
+            point = None
             print("Tracker reset")
 
         frame_to_process = None
