@@ -136,11 +136,21 @@ def on_mouse(event, x, y, flags, param):
             print("[Main] INIT done. Mask shape:", new_mask.shape)
 
     elif event == cv2.EVENT_RBUTTONDOWN:
-        print("[RightClick] => kill child + reset local mask.")
-        kill_child_infer_server()
+        ### Option 1: kill child + reset local mask
+        # print("[RightClick] => kill child + reset local mask.")
+        # kill_child_infer_server()
+        # mask = None
+        # point = None
+        # activeTrack = False
+
+        ### Option 2: reset local mask
+        print("[RightClick] => reset track (no kill).")
+        ensure_child_is_running()
+        reset_result = send_command_to_child("RESET")
         mask = None
         point = None
         activeTrack = False
+        print("[Main] Tracker reset, no points or objects are currently tracked.")
 
 cv2.namedWindow("image")
 cv2.namedWindow("mask")
