@@ -216,6 +216,8 @@ def refresh_mask_if_child_done():
 
 def main():
     global RUNNING
+    global latestFrame   # <-- add this line
+
     t = threading.Thread(target=server_thread, args=(args.host, args.port), daemon=True)
     t.start()
 
@@ -225,17 +227,18 @@ def main():
             RUNNING = False
             break
 
-        frameCopy = None
+        frame_to_process = None
         with latestFrameLock:
             if latestFrame is not None:
-                frameCopy = latestFrame.copy()
+                frame_to_process = latestFrame.copy()
                 latestFrame = None
 
-        if frameCopy is not None:
-            handle_frame(frameCopy)
+        if frame_to_process is not None:
+            handle_frame(frame_to_process)
 
     cv2.destroyAllWindows()
     print("Exiting main...")
+
 
 if __name__=="__main__":
     main()
