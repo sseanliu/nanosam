@@ -42,7 +42,7 @@ def spawn_child_infer_server():
     env["DECODER_PATH"] = args.mask_decoder
 
     # spawn
-    childProc = subprocess.Popen(["python", "childInferServerPath"], env=env)
+    childProc = subprocess.Popen(["python", childInferServerPath], env=env)
     print("[Main] Spawned child_infer_server process, loaded model once.")
 
 
