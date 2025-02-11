@@ -117,6 +117,7 @@ def server_thread(host, port):
             # produce mask
             out_mask_data = b''
             if mask is not None:
+                # same logic as before for sending
                 bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
                 ret, png_data = cv2.imencode('.png', bin_mask)
                 if ret:
@@ -143,9 +144,10 @@ def server_thread(host, port):
 
 def handle_frame(frame_bgr):
     """
-    We'll just do the overlay portion in the main thread.
-    'tracker.update(...)' is called in a separate thread, but also rate-limited
-    so we do not saturate the GPU frequently.
+    We'll do the overlay portion in the main thread.
+    'tracker.update(...)' is still in a separate thread, rate-limited.
+    The main difference is how we interpret 'bin_mask', 
+    matching the original logic from nanosam's example so it won't be inverted.
     """
     global mask, point, image_pil
     global updateInProgress, lastUpdateTime, updateInterval
@@ -153,30 +155,37 @@ def handle_frame(frame_bgr):
 
     image_pil = cv2_to_pil(frame_bgr)
 
-    # Rate-limiting check + concurrency check
+    # Rate-limiting + concurrency
     now = time.time()
     if tracker.token is not None and not updateInProgress and (now - lastUpdateTime) > updateInterval:
-        # store the current PIL for the worker
         lastImagePil = image_pil
         updateInProgress = True
-        lastUpdateTime = now  # mark time we started an update
+        lastUpdateTime = now
         t = threading.Thread(target=tracker_update_worker, daemon=True)
         t.start()
 
-    # do overlay with the existing mask
     disp = frame_bgr.copy()
     if mask is not None:
+        # EXACT original approach from sample:
+        # "bin_mask" = background, so object is "not bin_mask"
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
+
+        # create a green overlay
         green = np.zeros_like(disp)
-        green[:] = (0,185,118)
-        green[~bin_mask] = 0
+        green[:] = (0, 185, 118)
 
+        # zero out the background region
+        green[bin_mask] = 0
+
+        # blend
+        disp = cv2.addWeighted(disp, 0.4, green, 0.6, 0)
+
+        # (Optional) If you still want a "mask" window that shows object in white,
+        # we do it with "obj_mask = ~bin_mask"
+        obj_mask = np.logical_not(bin_mask)
         mask_disp = np.zeros_like(disp)
-        mask_disp[bin_mask] = (255,255,255)
+        mask_disp[obj_mask] = (255,255,255)
         cv2.imshow("mask", mask_disp)
-
-        alpha=0.6
-        disp = cv2.addWeighted(disp, 1-alpha, green, alpha, 0)
 
     if point is not None:
         cv2.circle(disp, point, 5, (0,185,118), -1)
