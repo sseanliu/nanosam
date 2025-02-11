@@ -38,9 +38,14 @@ updateInterval = 0.5
 
 lastImagePil = None
 
+# NEW: A global to forcibly cancel any in-progress update
+cancelInFlightUpdate = False
+
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
     global updateInProgress, lastUpdateTime
+    global cancelInFlightUpdate
+
     if event == cv2.EVENT_LBUTTONDBLCLK:
         if image_pil is not None:
             print("[DoubleClick] init track at:", (x, y))
@@ -50,17 +55,19 @@ def init_track(event, x, y, flags, param):
 
     elif event == cv2.EVENT_RBUTTONDOWN:
         print("[RightClick] Cancel tracking.")
-        # 1) Reset the tracker logic
+        # 1) Reset tracker
         tracker.reset()
-        # 2) Force the 'token' to None so 'tracker.update' won't run
+        # 2) Remove token => no future updates
         tracker.token = None
         # 3) Clear mask & point
         mask = None
         point = None
-        # 4) Cancel any concurrency if mid-update
+        # 4) Mark concurrency as done
         updateInProgress = False
-        # 5) Reset lastUpdateTime so next attempt won't be blocked
+        # 5) Reset lastUpdateTime
         lastUpdateTime = 0
+        # 6) Force-cancel any in-flight
+        cancelInFlightUpdate = True
 
 cv2.namedWindow('image')
 cv2.namedWindow('mask')
@@ -121,7 +128,7 @@ def server_thread(host, port):
                 global latestFrame
                 latestFrame = frame
 
-            # produce mask to send back
+            # produce mask
             out_mask_data = b''
             if mask is not None:
                 bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
@@ -152,12 +159,13 @@ def handle_frame(frame_bgr):
     global mask, point, image_pil
     global updateInProgress, lastUpdateTime, updateInterval
     global lastImagePil
+    global cancelInFlightUpdate
 
     image_pil = cv2_to_pil(frame_bgr)
 
-    # Rate-limiting + concurrency
     now = time.time()
-    if tracker.token is not None and not updateInProgress and (now - lastUpdateTime) > updateInterval:
+    # Only do tracker update if token != None and not cancelled
+    if (tracker.token is not None) and (not updateInProgress) and (now - lastUpdateTime > updateInterval) and (not cancelInFlightUpdate):
         lastImagePil = image_pil
         updateInProgress = True
         lastUpdateTime = now
@@ -166,7 +174,6 @@ def handle_frame(frame_bgr):
 
     disp = frame_bgr.copy()
     if mask is not None:
-        # Original logic
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
 
         green = np.zeros_like(disp)
@@ -175,7 +182,6 @@ def handle_frame(frame_bgr):
 
         disp = cv2.addWeighted(disp, 0.4, green, 0.6, 0)
 
-        # optional separate window
         obj_mask = np.logical_not(bin_mask)
         mask_disp = np.zeros_like(disp)
         mask_disp[obj_mask] = (255,255,255)
@@ -188,16 +194,32 @@ def handle_frame(frame_bgr):
 
 def tracker_update_worker():
     global updateInProgress, mask, point, lastImagePil
+    global cancelInFlightUpdate
+
     print("[TrackerThread] Starting update...")
     try:
+        # Check if user canceled mid-flight
+        if cancelInFlightUpdate:
+            print("[TrackerThread] Aborting update (cancelInFlightUpdate).")
+            return
         new_mask, new_point = tracker.update(lastImagePil)
+        
+        # If user canceled *during* the forward pass
+        if cancelInFlightUpdate:
+            print("[TrackerThread] Cancelled mid-forward pass.")
+            return
+        
         if new_mask is not None:
             mask = new_mask
             point = new_point
+
     except Exception as e:
         print("[TrackerThread] error:", e)
-    updateInProgress = False
-    print("[TrackerThread] Done update.")
+    finally:
+        # We reset concurrency flags no matter what
+        updateInProgress = False
+        cancelInFlightUpdate = False
+        print("[TrackerThread] Done update.")
 
 def main():
     global RUNNING
@@ -228,6 +250,7 @@ def main():
 
     cv2.destroyAllWindows()
     print("Exiting main...")
+    
 
 if __name__=="__main__":
     main()
