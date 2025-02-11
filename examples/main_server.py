@@ -206,6 +206,9 @@ def server_thread():
 
 def main():
     global RUNNING
+    global mask
+    global point
+    global childProc
 
     # 1) spawn child_infer_server
     spawn_child_infer_server()
