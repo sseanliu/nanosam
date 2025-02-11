@@ -38,7 +38,7 @@ updateInterval = 0.5
 
 lastImagePil = None
 
-# NEW: A global to forcibly cancel any in-progress update
+# For forcibly canceling an update
 cancelInFlightUpdate = False
 
 def init_track(event, x, y, flags, param):
@@ -55,18 +55,12 @@ def init_track(event, x, y, flags, param):
 
     elif event == cv2.EVENT_RBUTTONDOWN:
         print("[RightClick] Cancel tracking.")
-        # 1) Reset tracker
         tracker.reset()
-        # 2) Remove token => no future updates
         tracker.token = None
-        # 3) Clear mask & point
         mask = None
         point = None
-        # 4) Mark concurrency as done
         updateInProgress = False
-        # 5) Reset lastUpdateTime
         lastUpdateTime = 0
-        # 6) Force-cancel any in-flight
         cancelInFlightUpdate = True
 
 cv2.namedWindow('image')
@@ -126,12 +120,13 @@ def server_thread(host, port):
 
             with latestFrameLock:
                 global latestFrame
+                # Overwrite the previous frame with the newest
                 latestFrame = frame
 
             # produce mask
             out_mask_data = b''
             if mask is not None:
-                bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
+                bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8) * 255
                 ret, png_data = cv2.imencode('.png', bin_mask)
                 if ret:
                     out_mask_data = png_data.tobytes()
@@ -161,10 +156,11 @@ def handle_frame(frame_bgr):
     global lastImagePil
     global cancelInFlightUpdate
 
+    # Convert to PIL
     image_pil = cv2_to_pil(frame_bgr)
 
+    # If there's an active token, we do a rate-limited concurrency update
     now = time.time()
-    # Only do tracker update if token != None and not cancelled
     if (tracker.token is not None) and (not updateInProgress) and (now - lastUpdateTime > updateInterval) and (not cancelInFlightUpdate):
         lastImagePil = image_pil
         updateInProgress = True
@@ -172,10 +168,10 @@ def handle_frame(frame_bgr):
         t = threading.Thread(target=tracker_update_worker, daemon=True)
         t.start()
 
+    # Do the normal overlay with existing mask
     disp = frame_bgr.copy()
     if mask is not None:
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
-
         green = np.zeros_like(disp)
         green[:] = (0,185,118)
         green[bin_mask] = 0
@@ -198,25 +194,21 @@ def tracker_update_worker():
 
     print("[TrackerThread] Starting update...")
     try:
-        # Check if user canceled mid-flight
         if cancelInFlightUpdate:
-            print("[TrackerThread] Aborting update (cancelInFlightUpdate).")
+            print("[TrackerThread] Aborting update (cancel flag).")
             return
         new_mask, new_point = tracker.update(lastImagePil)
-        
-        # If user canceled *during* the forward pass
+
         if cancelInFlightUpdate:
             print("[TrackerThread] Cancelled mid-forward pass.")
             return
-        
+
         if new_mask is not None:
             mask = new_mask
             point = new_point
-
     except Exception as e:
         print("[TrackerThread] error:", e)
     finally:
-        # We reset concurrency flags no matter what
         updateInProgress = False
         cancelInFlightUpdate = False
         print("[TrackerThread] Done update.")
@@ -230,6 +222,16 @@ def main():
 
     while True:
         ret = cv2.waitKey(30)
+
+        # If an update is in progress => skip displaying older frames
+        # so we only show new frames after the pass finishes
+        if updateInProgress:
+            # read any queued frames from server => discard them
+            # but do "continue" to skip handle_frame
+            with latestFrameLock:
+                latestFrame = None
+            continue
+
         if ret == ord('q'):
             RUNNING = False
             break
@@ -250,7 +252,6 @@ def main():
 
     cv2.destroyAllWindows()
     print("Exiting main...")
-    
 
 if __name__=="__main__":
     main()
