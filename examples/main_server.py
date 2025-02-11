@@ -28,6 +28,10 @@ RUNNING = True
 
 childProc = None   # The separate GPU process
 
+scriptDir = os.path.dirname(os.path.abspath(__file__))
+childInferServerPath = os.path.join(scriptDir, "child_infer_server.py")
+
+
 def spawn_child_infer_server():
     global childProc
     if childProc is not None:
@@ -38,7 +42,7 @@ def spawn_child_infer_server():
     env["DECODER_PATH"] = args.mask_decoder
 
     # spawn
-    childProc = subprocess.Popen(["python", "child_infer_server.py"], env=env)
+    childProc = subprocess.Popen(["python", "childInferServerPath"], env=env)
     print("[Main] Spawned child_infer_server process, loaded model once.")
 
 
