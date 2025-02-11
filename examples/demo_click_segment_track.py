@@ -20,9 +20,11 @@ args = parser.parse_args()
 def cv2_to_pil(image_bgr):
     return PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
+# Initialize predictor + tracker as in original example
 predictor = Predictor(args.image_encoder, args.mask_decoder)
 tracker = Tracker(predictor)
 
+# Globals for mask, point, etc.
 mask = None
 point = None
 image_pil = None
@@ -31,43 +33,36 @@ latestFrame = None
 latestFrameLock = threading.Lock()
 RUNNING = True
 
-# Rate-limit and concurrency flags
-updateInProgress = False
-lastUpdateTime = 0.0
-updateInterval = 0.5
-
-lastImagePil = None
-
-# For forcibly canceling an update
-cancelInFlightUpdate = False
-
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
-    global updateInProgress, lastUpdateTime
-    global cancelInFlightUpdate
 
     if event == cv2.EVENT_LBUTTONDBLCLK:
         if image_pil is not None:
             print("[DoubleClick] init track at:", (x, y))
-            mask = tracker.init(image_pil, point=(x, y))
+            # 1) Initialize tracking
+            mask_init = tracker.init(image_pil, point=(x, y))
+            mask = mask_init
             point = (x, y)
             print("[DoubleClick] track init done.")
 
     elif event == cv2.EVENT_RBUTTONDOWN:
-        print("[RightClick] Cancel tracking.")
+        print("[RightClick] Cancel/Reset tracking.")
+        # 1) Reset the tracker
         tracker.reset()
+        # 2) Clear out the mask + point + token
         tracker.token = None
         mask = None
         point = None
-        updateInProgress = False
-        lastUpdateTime = 0
-        cancelInFlightUpdate = True
 
 cv2.namedWindow('image')
 cv2.namedWindow('mask')
 cv2.setMouseCallback('image', init_track)
 
 def server_thread(host, port):
+    """
+    Receives frames from Vision Pro (or similar) via TCP,
+    storing the latest one in `latestFrame`.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((host, port))
@@ -115,15 +110,15 @@ def server_thread(host, port):
 
             frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
-                print("Failed to decode.")
+                print("Failed to decode incoming frame.")
                 continue
 
+            # store latest in global
             with latestFrameLock:
                 global latestFrame
-                # Overwrite the previous frame with the newest
                 latestFrame = frame
 
-            # produce mask
+            # Also produce + send back mask if we have one
             out_mask_data = b''
             if mask is not None:
                 bin_mask = (mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8) * 255
@@ -140,7 +135,7 @@ def server_thread(host, port):
         except socket.timeout:
             continue
         except Exception as e:
-            print("Server error:", e)
+            print("Server thread error:", e)
             conn.close()
             conn = None
             continue
@@ -151,24 +146,24 @@ def server_thread(host, port):
     print("Server closed...")
 
 def handle_frame(frame_bgr):
+    """
+    Synchronous approach (like the original example).
+    If the tracker.token is set, we directly call tracker.update(...) each frame.
+    Then we overlay the result.
+    """
     global mask, point, image_pil
-    global updateInProgress, lastUpdateTime, updateInterval
-    global lastImagePil
-    global cancelInFlightUpdate
 
     # Convert to PIL
     image_pil = cv2_to_pil(frame_bgr)
 
-    # If there's an active token, we do a rate-limited concurrency update
-    now = time.time()
-    if (tracker.token is not None) and (not updateInProgress) and (now - lastUpdateTime > updateInterval) and (not cancelInFlightUpdate):
-        lastImagePil = image_pil
-        updateInProgress = True
-        lastUpdateTime = now
-        t = threading.Thread(target=tracker_update_worker, daemon=True)
-        t.start()
+    # If we have a tracker.token, do a synchronous update
+    if tracker.token is not None:
+        mask_update, pt_update = tracker.update(image_pil)
+        if mask_update is not None:
+            mask = mask_update
+            point = pt_update
 
-    # Do the normal overlay with existing mask
+    # Overlay the mask
     disp = frame_bgr.copy()
     if mask is not None:
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
@@ -178,75 +173,51 @@ def handle_frame(frame_bgr):
 
         disp = cv2.addWeighted(disp, 0.4, green, 0.6, 0)
 
+        # optional separate window to show the mask in white
         obj_mask = np.logical_not(bin_mask)
         mask_disp = np.zeros_like(disp)
         mask_disp[obj_mask] = (255,255,255)
         cv2.imshow("mask", mask_disp)
+    else:
+        # if no mask, black mask window
+        black_img = np.zeros_like(disp)
+        cv2.imshow("mask", black_img)
 
+    # If we have a point, draw a circle
     if point is not None:
-        cv2.circle(disp, point, 5, (0,185,118), -1)
+        disp = cv2.circle(disp, point, 5, (0,185,118), -1)
 
     cv2.imshow("image", disp)
-
-def tracker_update_worker():
-    global updateInProgress, mask, point, lastImagePil
-    global cancelInFlightUpdate
-
-    print("[TrackerThread] Starting update...")
-    try:
-        if cancelInFlightUpdate:
-            print("[TrackerThread] Aborting update (cancel flag).")
-            return
-        new_mask, new_point = tracker.update(lastImagePil)
-
-        if cancelInFlightUpdate:
-            print("[TrackerThread] Cancelled mid-forward pass.")
-            return
-
-        if new_mask is not None:
-            mask = new_mask
-            point = new_point
-    except Exception as e:
-        print("[TrackerThread] error:", e)
-    finally:
-        updateInProgress = False
-        cancelInFlightUpdate = False
-        print("[TrackerThread] Done update.")
 
 def main():
     global RUNNING
     global latestFrame
 
+    # Start the server thread
     t = threading.Thread(target=server_thread, args=(args.host, args.port), daemon=True)
     t.start()
 
     while True:
+        # poll for user input
         ret = cv2.waitKey(30)
-
-        # If an update is in progress => skip displaying older frames
-        # so we only show new frames after the pass finishes
-        if updateInProgress:
-            # read any queued frames from server => discard them
-            # but do "continue" to skip handle_frame
-            with latestFrameLock:
-                latestFrame = None
-            continue
-
         if ret == ord('q'):
             RUNNING = False
             break
         elif ret == ord('r'):
             tracker.reset()
+            tracker.token = None
             mask = None
             point = None
             print("Tracker reset")
 
+        # fetch the latest frame
         frame_to_process = None
         with latestFrameLock:
             if latestFrame is not None:
                 frame_to_process = latestFrame.copy()
                 latestFrame = None
 
+        # If we have a new frame, do synchronous update + display
         if frame_to_process is not None:
             handle_frame(frame_to_process)
 
