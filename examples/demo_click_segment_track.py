@@ -40,12 +40,20 @@ lastImagePil = None  # stores the last PIL image used for the worker
 
 def init_track(event, x, y, flags, param):
     global mask, point, image_pil
+    # 1) Double-left-click => initialize tracking
     if event == cv2.EVENT_LBUTTONDBLCLK:
         if image_pil is not None:
             print("[DoubleClick] init track at:", (x, y))
             mask = tracker.init(image_pil, point=(x, y))
             point = (x, y)
             print("[DoubleClick] track init done.")
+
+    # 2) Right-click => cancel current tracking
+    elif event == cv2.EVENT_RBUTTONDOWN:
+        print("[RightClick] Cancel tracking.")
+        tracker.reset()
+        mask = None
+        point = None
 
 cv2.namedWindow('image')
 cv2.namedWindow('mask')
@@ -145,7 +153,7 @@ def handle_frame(frame_bgr):
 
     image_pil = cv2_to_pil(frame_bgr)
 
-    # (2) Rate-limiting check + concurrency check
+    # Rate-limiting check + concurrency check
     now = time.time()
     if tracker.token is not None and not updateInProgress and (now - lastUpdateTime) > updateInterval:
         # store the current PIL for the worker
@@ -155,7 +163,7 @@ def handle_frame(frame_bgr):
         t = threading.Thread(target=tracker_update_worker, daemon=True)
         t.start()
 
-    # overlay with the existing mask
+    # do overlay with the existing mask
     disp = frame_bgr.copy()
     if mask is not None:
         bin_mask = (mask[0,0].detach().cpu().numpy() < 0)
