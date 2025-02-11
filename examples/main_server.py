@@ -19,19 +19,19 @@ parser.add_argument("--child_host", type=str, default="127.0.0.1", help="child G
 parser.add_argument("--child_port", type=int, default=55555, help="child GPU server port")
 args = parser.parse_args()
 
-# We'll store the mask from child
 mask = None
 point = None
 
-# We'll store the latest frame from VisionPro
 latestFrame = None
 latestFrameLock = threading.Lock()
 RUNNING = True
 
-# We'll spawn a separate childInferServer
 childProc = None
 scriptDir = os.path.dirname(os.path.abspath(__file__))
 childInferServerPath = os.path.join(scriptDir, "child_infer_server.py")
+
+# We'll hold a lastFrameForTracking if we don't get a brand new frame
+lastFrameForTracking = None
 
 def spawn_child_infer_server():
     global childProc
@@ -55,17 +55,12 @@ def ensure_child_is_running():
     if childProc is None or childProc.poll() is not None:
         print("[Main] Child not running. Spawning again.")
         spawn_child_infer_server()
-        time.sleep(0.5)  # allow it to start listening
+        # Increase wait to 2s or so
+        time.sleep(2.0)
 
 def send_command_to_child(cmd_str):
-    """
-    e.g. "INIT 200 150 tmp_input.jpg"
-         "UPDATE tmp_input.jpg"
-         "RESET"
-    Returns mask as grayscale np.uint8, or None
-    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(1.0)
+    sock.settimeout(3.0)  # was 1.0
     try:
         sock.connect((args.child_host, args.child_port))
         cmd_bytes = cmd_str.encode('utf-8')
@@ -79,7 +74,7 @@ def send_command_to_child(cmd_str):
             return None
         (mask_len,) = struct.unpack('<i', length_data)
         if mask_len<=0:
-            print("[Main->Child] mask_len=0 => no mask.")
+            print("[Main->Child] child returned mask_len=0 => no mask.")
             return None
 
         mask_bytes = b''
@@ -103,22 +98,27 @@ def send_command_to_child(cmd_str):
     finally:
         sock.close()
 
-# These track whether we have an active track in the child
-activeTrack = False
-
 def on_mouse(event, x, y, flags, param):
-    global mask, point, activeTrack
+    global mask, point, lastFrameForTracking
     if event == cv2.EVENT_LBUTTONDBLCLK:
         print("[DoubleClick] => INIT track in child.")
         ensure_child_is_running()
 
+        # try to get new frame, else re-use lastFrameForTracking
         frameCopy = None
         with latestFrameLock:
             if latestFrame is not None:
                 frameCopy = latestFrame.copy()
+                latestFrame = None
+        if frameCopy is None and lastFrameForTracking is not None:
+            frameCopy = lastFrameForTracking.copy()
+
         if frameCopy is None:
-            print("[Main] No frame to run child on.")
+            print("[Main] No frame to run child on. (none at all).")
             return
+
+        # store the frame for subsequent updates
+        lastFrameForTracking = frameCopy.copy()
 
         frame_path = "tmp_input.jpg"
         cv2.imwrite(frame_path, frameCopy)
@@ -128,7 +128,6 @@ def on_mouse(event, x, y, flags, param):
         if new_mask is not None:
             mask = new_mask
             point = (x, y)
-            activeTrack = True
             print("[Main] INIT done. Mask shape:", new_mask.shape)
 
     elif event == cv2.EVENT_RBUTTONDOWN:
@@ -136,7 +135,6 @@ def on_mouse(event, x, y, flags, param):
         kill_child_infer_server()
         mask = None
         point = None
-        activeTrack = False
 
 cv2.namedWindow("image")
 cv2.namedWindow("mask")
@@ -210,8 +208,10 @@ def server_thread():
     print("[Main] Feed server stopped.")
 
 def main():
-    global RUNNING, mask, point, activeTrack
-    spawn_child_infer_server()  # start child once
+    global RUNNING, mask, point, childProc, lastFrameForTracking
+
+    spawn_child_infer_server()
+
     t = threading.Thread(target=server_thread, daemon=True)
     t.start()
 
@@ -221,32 +221,29 @@ def main():
             RUNNING = False
             break
         elif key == ord('r'):
+            # reset child
             ensure_child_is_running()
-            send_command_to_child("RESET")
+            new_mask = send_command_to_child("RESET")
             mask = None
             point = None
-            activeTrack = False
-            print("[Main] Reset done => no active track now.")
+            print("[Main] RESET => mask cleared, no active track.")
+        else:
+            # Optionally, if you want dynamic updates on each new frame:
+            # read the frame, if we have a track, do "UPDATE"
+            # omitted if you only do single-shot init each time
+            pass
 
-        # if we have an active track, let's do "UPDATE" for each new frame => dynamic
+        # show image
         frameCopy = None
         with latestFrameLock:
             if latestFrame is not None:
                 frameCopy = latestFrame.copy()
                 latestFrame = None
+        if frameCopy is None and lastFrameForTracking is not None:
+            frameCopy = lastFrameForTracking.copy()
 
         if frameCopy is not None:
-            # if activeTrack => do an "UPDATE" call
-            if activeTrack:
-                ensure_child_is_running()
-                # Save frame for update
-                frame_path = "tmp_input.jpg"
-                cv2.imwrite(frame_path, frameCopy)
-                new_mask = send_command_to_child(f"UPDATE {frame_path}")
-                if new_mask is not None:
-                    mask = new_mask
-
-            # overlay local mask
+            lastFrameForTracking = frameCopy.copy()
             disp = frameCopy.copy()
             if mask is not None:
                 bin_mask = (mask < 128)
