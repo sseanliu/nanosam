@@ -1,4 +1,3 @@
-# main_server.py (or your existing script)
 import PIL.Image
 import cv2
 import numpy as np
@@ -10,10 +9,7 @@ import time
 import os
 import subprocess
 
-# We no longer do: from nanosam.utils.predictor import Predictor
-# or from nanosam.utils.tracker import Tracker
-# Because child_infer.py has them instead.
-
+# We remove local predictor/tracker usage. It's all in child_infer
 parser = argparse.ArgumentParser()
 parser.add_argument("--image_encoder", type=str, default="data/resnet18_image_encoder.engine")
 parser.add_argument("--mask_decoder", type=str, default="data/mobile_sam_mask_decoder.engine")
@@ -22,10 +18,9 @@ parser.add_argument("--port", type=int, default=12345, help="Listen Port")
 args = parser.parse_args()
 
 def cv2_to_pil(image_bgr):
-    # We keep your function, but we won't do local predictor usage
     return PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
-# Keep these global for overlay
+# We'll keep your global overlay variables
 mask = None
 point = None
 
@@ -33,16 +28,15 @@ latestFrame = None
 latestFrameLock = threading.Lock()
 RUNNING = True
 
-# We no longer keep updateInProgress or concurrency logic, since child does the net pass
-childProc = None       # reference to the spawned child process
-maskTimestamp = 0.0    # to track if we read the new mask file
+childProc = None  # reference to the spawned child process
 
-def init_track(event, x, y, flags, param):
-    global mask, point
-    global childProc
+# Build an absolute path to child_infer.py
+scriptDir = os.path.dirname(os.path.abspath(__file__))  # folder of main_server.py
+childInferPath = os.path.join(scriptDir, "child_infer.py")
 
+def on_mouse(event, x, y, flags, param):
+    global childProc, mask, point
     if event == cv2.EVENT_LBUTTONDBLCLK:
-        # double-click => spawn child_infer
         print("[DoubleClick] => spawn child process")
         frameCopy = None
         with latestFrameLock:
@@ -52,45 +46,40 @@ def init_track(event, x, y, flags, param):
             print("No frame to run child on.")
             return
 
-        # 1) Write the frame to disk
         input_path = "tmp_input.jpg"
         output_path = "tmp_mask.png"
         cv2.imwrite(input_path, frameCopy)
 
-        # 2) If there's an existing childProc, kill it
+        # kill old child if any
         if childProc is not None:
-            print("Killing old childProc before starting new.")
             childProc.terminate()
             childProc = None
 
-        # 3) Build the command, pass encoder/decoder from your original args
+        # We pass encoder, decoder, input, output, plus click_x, click_y
         cmd = [
-            "python", "child_infer.py",
+            "python", childInferPath,
             args.image_encoder,
             args.mask_decoder,
             input_path,
             output_path,
-            str(x), str(y)    # pass the click coords
+            str(x), str(y)
         ]
-
-        # 4) Launch child process
         childProc = subprocess.Popen(cmd)
-        print(f"Spawned child_infer with click=({x},{y}).")
+        print(f"Spawned child_infer: click=({x},{y}).")
 
     elif event == cv2.EVENT_RBUTTONDOWN:
-        # right-click => forcibly kill child if any
         print("[RightClick] => kill child process")
         if childProc is not None:
             childProc.terminate()
             childProc = None
             print("Child process killed.")
-        # Also clear existing mask
+        # also reset local mask/point
         mask = None
         point = None
 
-cv2.namedWindow('image')
-cv2.namedWindow('mask')
-cv2.setMouseCallback('image', init_track)
+cv2.namedWindow("image")
+cv2.namedWindow("mask")
+cv2.setMouseCallback("image", on_mouse)
 
 def server_thread(host, port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -159,19 +148,37 @@ def server_thread(host, port):
     s.close()
     print("Server closed...")
 
-def handle_frame(frame_bgr):
-    """
-    We no longer do local tracking. We only overlay the 'mask' if we have it from the child.
-    If the child finishes, we read tmp_mask.png and store in 'mask'.
-    """
-    global mask, point
-    # 1) Check if childProc finished => read mask from disk if new
-    refresh_mask_if_child_done()
+def read_child_mask_if_done():
+    global childProc, mask
+    if childProc is None:
+        return
+    retcode = childProc.poll()
+    if retcode is None:
+        return  # still running
+    # done or crashed
+    childProc = None
+    output_path = "tmp_mask.png"
+    if not os.path.exists(output_path):
+        print("[ChildInfer] done but no output mask found.")
+        mask = None
+        return
+    new_mask = cv2.imread(output_path, cv2.IMREAD_GRAYSCALE)
+    if new_mask is None:
+        print("[ChildInfer] mask file invalid.")
+        mask = None
+        return
+    mask = new_mask
+    print("[ChildInfer] loaded new mask from disk.")
 
-    # 2) Overlay mask if present
+def handle_frame(frame_bgr):
+    global mask, point
+
+    # If childProc finished, read the resulting mask
+    read_child_mask_if_done()
+
     disp = frame_bgr.copy()
     if mask is not None:
-        bin_mask = (mask < 128)  # treat <128 as background
+        bin_mask = (mask < 128)
         green = np.zeros_like(disp)
         green[:] = (0,185,118)
         green[bin_mask] = 0
@@ -182,41 +189,11 @@ def handle_frame(frame_bgr):
         mask_disp[obj_mask] = (255,255,255)
         cv2.imshow("mask", mask_disp)
 
-    # 3) Show in main window
     cv2.imshow("image", disp)
-
-def refresh_mask_if_child_done():
-    global childProc, mask, maskTimestamp
-    if childProc is None:
-        return
-    # poll() returns None if still running, or exit code if finished
-    retcode = childProc.poll()
-    if retcode is None:
-        # child still running
-        return
-
-    # child finished, so read tmp_mask.png
-    childProc = None
-    output_path = "tmp_mask.png"
-    if not os.path.exists(output_path):
-        print("[ChildInfer] finished but no mask file found.")
-        mask = None
-        return
-
-    # read it
-    new_mask_img = cv2.imread(output_path, cv2.IMREAD_GRAYSCALE)
-    if new_mask_img is None:
-        print("[ChildInfer] Mask file invalid or empty.")
-        mask = None
-        return
-
-    # store in 'mask'
-    mask = new_mask_img
-    print("[ChildInfer] loaded new mask from disk.")
 
 def main():
     global RUNNING
-    global latestFrame   # <-- add this line
+    global latestFrame
 
     t = threading.Thread(target=server_thread, args=(args.host, args.port), daemon=True)
     t.start()
@@ -227,18 +204,17 @@ def main():
             RUNNING = False
             break
 
-        frame_to_process = None
+        frameCopy = None
         with latestFrameLock:
             if latestFrame is not None:
-                frame_to_process = latestFrame.copy()
+                frameCopy = latestFrame.copy()
                 latestFrame = None
 
-        if frame_to_process is not None:
-            handle_frame(frame_to_process)
+        if frameCopy is not None:
+            handle_frame(frameCopy)
 
     cv2.destroyAllWindows()
     print("Exiting main...")
-
 
 if __name__=="__main__":
     main()
