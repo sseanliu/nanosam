@@ -12,12 +12,12 @@ from nanosam.utils.predictor import Predictor
 from nanosam.utils.tracker import Tracker
 
 HOST = "127.0.0.1"
-PORT = 55555  # or any free port
+PORT = 55555
 
 predictor = None
 tracker = None
-mask_cache = None  # holds latest mask across frames
-point_cache = None # holds the initial point (for reference)
+mask_cache = None
+point_cache = None
 
 def load_model_once():
     global predictor, tracker
@@ -29,58 +29,56 @@ def load_model_once():
     print("[ChildServer] Model loaded successfully.")
 
 def handle_init(parts, conn):
-    # command: "INIT x y path_to_frame"
     # e.g. parts = ["INIT","200","150","tmp_input.jpg"]
     if len(parts) < 4:
-        print("[ChildServer] INIT missing arguments.")
+        print("[ChildServer] INIT missing args.")
         send_mask(None, conn)
         return
     x = int(parts[1])
     y = int(parts[2])
-    frame_path = parts[3]
+    img_path = parts[3]
 
-    image_bgr = cv2.imread(frame_path)
+    image_bgr = cv2.imread(img_path)
     if image_bgr is None:
-        print("[ChildServer] INIT could not read frame:", frame_path)
+        print("[ChildServer] INIT could not read frame:", img_path)
         send_mask(None, conn)
         return
 
     image_pil = PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+
     global mask_cache, point_cache
-    print(f"[ChildServer] tracker.init @ ({x},{y})")
-    mask_init = tracker.init(image_pil, point=(x, y))
-    mask_cache = mask_init
+    print(f"[ChildServer] tracker.init @ ({x}, {y}) with {img_path}")
+    init_mask = tracker.init(image_pil, point=(x, y))
+    mask_cache = init_mask
     point_cache = (x, y)
-    send_mask(mask_init, conn)
+    send_mask(init_mask, conn)
 
 def handle_update(parts, conn):
-    # command: "UPDATE path_to_frame"
     # e.g. parts = ["UPDATE","tmp_input.jpg"]
     if len(parts) < 2:
         print("[ChildServer] UPDATE missing frame path.")
         send_mask(None, conn)
         return
-    frame_path = parts[1]
+    img_path = parts[1]
 
-    image_bgr = cv2.imread(frame_path)
+    image_bgr = cv2.imread(img_path)
     if image_bgr is None:
-        print("[ChildServer] UPDATE could not read frame:", frame_path)
+        print("[ChildServer] UPDATE could not read frame:", img_path)
         send_mask(None, conn)
         return
 
     image_pil = PIL.Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
     global mask_cache, point_cache
-    # If tracker.token is None, we have no active track => return None
     if tracker.token is None:
-        print("[ChildServer] UPDATE called but no active track.")
+        print("[ChildServer] UPDATE but no active track.")
         send_mask(None, conn)
         return
 
-    print("[ChildServer] tracker.update() with new frame:", frame_path)
-    new_mask, new_point = tracker.update(image_pil)
+    print("[ChildServer] tracker.update() with:", img_path)
+    new_mask, new_pt = tracker.update(image_pil)
     if new_mask is not None:
         mask_cache = new_mask
-        point_cache = new_point
+        point_cache = new_pt
     send_mask(new_mask, conn)
 
 def handle_reset(parts, conn):
@@ -92,34 +90,33 @@ def handle_reset(parts, conn):
     send_mask(None, conn)
 
 def send_mask(sam_mask, conn):
-    """
-    Convert sam_mask to bin_mask. If None => send length=0
-    """
+    # If None => length=0
     if sam_mask is None:
-        header = struct.pack('<i', 0)
-        conn.sendall(header)
+        hdr = struct.pack('<i', 0)
+        conn.sendall(hdr)
         return
 
+    # same approach: <0 => background => we convert object=255, background=0
     bin_mask = (sam_mask[0,0].detach().cpu().numpy() < 0).astype(np.uint8)*255
     ret, png_data = cv2.imencode('.png', bin_mask)
     if not ret:
-        header = struct.pack('<i', 0)
-        conn.sendall(header)
+        hdr = struct.pack('<i', 0)
+        conn.sendall(hdr)
         return
     mask_bytes = png_data.tobytes()
-    header = struct.pack('<i', len(mask_bytes))
-    conn.sendall(header)
+    hdr = struct.pack('<i', len(mask_bytes))
+    conn.sendall(hdr)
     conn.sendall(mask_bytes)
 
 def client_handler(conn):
     while True:
-        header = conn.recv(4)
-        if not header or len(header)<4:
+        head = conn.recv(4)
+        if not head or len(head)<4:
             print("[ChildServer] client disconnected.")
             break
-        (cmd_len,) = struct.unpack('<i', header)
+        (cmd_len,) = struct.unpack('<i', head)
         if cmd_len<=0:
-            print("[ChildServer] Invalid cmd_len:", cmd_len)
+            print("[ChildServer] invalid cmd_len:", cmd_len)
             break
 
         cmd_data = b''
@@ -131,8 +128,9 @@ def client_handler(conn):
             cmd_data += chunk
             to_read -= len(chunk)
         if len(cmd_data)<cmd_len:
-            print("[ChildServer] partial cmd => disconnect.")
+            print("[ChildServer] partial cmd => break")
             break
+
         cmd_str = cmd_data.decode('utf-8').strip()
         parts = cmd_str.split()
         if not parts:
@@ -146,7 +144,7 @@ def client_handler(conn):
         elif cmd=="RESET":
             handle_reset(parts, conn)
         else:
-            print("[ChildServer] Unknown command:", cmd)
+            print("[ChildServer] unknown command:", cmd)
             send_mask(None, conn)
     conn.close()
 
@@ -161,7 +159,8 @@ def main():
     while True:
         conn, addr = s.accept()
         print("[ChildServer] Got connection from", addr)
-        threading.Thread(target=client_handler, args=(conn,), daemon=True).start()
+        th = threading.Thread(target=client_handler, args=(conn,), daemon=True)
+        th.start()
 
 if __name__=="__main__":
     main()

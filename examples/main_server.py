@@ -19,18 +19,22 @@ parser.add_argument("--child_host", type=str, default="127.0.0.1", help="child G
 parser.add_argument("--child_port", type=int, default=55555, help="child GPU server port")
 args = parser.parse_args()
 
+# We'll track the current mask + track state
 mask = None
 point = None
+activeTrack = False  # if true, we do repeated "UPDATE" calls
 
+# The latest frame from VisionPro
 latestFrame = None
 latestFrameLock = threading.Lock()
 RUNNING = True
 
+# We'll spawn the child
 childProc = None
 scriptDir = os.path.dirname(os.path.abspath(__file__))
 childInferServerPath = os.path.join(scriptDir, "child_infer_server.py")
 
-# We'll hold a lastFrameForTracking if we don't get a brand new frame
+# If we never get a new frame, we store the last one used
 lastFrameForTracking = None
 
 def spawn_child_infer_server():
@@ -55,12 +59,13 @@ def ensure_child_is_running():
     if childProc is None or childProc.poll() is not None:
         print("[Main] Child not running. Spawning again.")
         spawn_child_infer_server()
-        # Increase wait to 2s or so
-        time.sleep(2.0)
+        # Wait 2-3s for heavy model load
+        time.sleep(3.0)
 
 def send_command_to_child(cmd_str):
+    # e.g. "INIT 100 150 tmp.jpg", "UPDATE tmp.jpg", "RESET"
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(3.0)  # was 1.0
+    sock.settimeout(5.0)  # bigger timeout for TRT load
     try:
         sock.connect((args.child_host, args.child_port))
         cmd_bytes = cmd_str.encode('utf-8')
@@ -99,12 +104,13 @@ def send_command_to_child(cmd_str):
         sock.close()
 
 def on_mouse(event, x, y, flags, param):
-    global mask, point, lastFrameForTracking
+    global mask, point, activeTrack, lastFrameForTracking
+    global latestFrame
     if event == cv2.EVENT_LBUTTONDBLCLK:
         print("[DoubleClick] => INIT track in child.")
         ensure_child_is_running()
 
-        # try to get new frame, else re-use lastFrameForTracking
+        # pick newest or fallback frame
         frameCopy = None
         with latestFrameLock:
             if latestFrame is not None:
@@ -114,20 +120,19 @@ def on_mouse(event, x, y, flags, param):
             frameCopy = lastFrameForTracking.copy()
 
         if frameCopy is None:
-            print("[Main] No frame to run child on. (none at all).")
+            print("[Main] No frame to run child on (none at all).")
             return
 
-        # store the frame for subsequent updates
         lastFrameForTracking = frameCopy.copy()
 
         frame_path = "tmp_input.jpg"
         cv2.imwrite(frame_path, frameCopy)
-
         cmd_str = f"INIT {x} {y} {frame_path}"
         new_mask = send_command_to_child(cmd_str)
         if new_mask is not None:
             mask = new_mask
             point = (x, y)
+            activeTrack = True
             print("[Main] INIT done. Mask shape:", new_mask.shape)
 
     elif event == cv2.EVENT_RBUTTONDOWN:
@@ -135,12 +140,14 @@ def on_mouse(event, x, y, flags, param):
         kill_child_infer_server()
         mask = None
         point = None
+        activeTrack = False
 
 cv2.namedWindow("image")
 cv2.namedWindow("mask")
 cv2.setMouseCallback("image", on_mouse)
 
 def server_thread():
+    global latestFrame
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((args.host, args.port))
@@ -191,7 +198,6 @@ def server_thread():
                 continue
 
             with latestFrameLock:
-                global latestFrame
                 latestFrame = frame
 
         except socket.timeout:
@@ -208,7 +214,7 @@ def server_thread():
     print("[Main] Feed server stopped.")
 
 def main():
-    global RUNNING, mask, point, childProc, lastFrameForTracking
+    global RUNNING, mask, point, childProc, lastFrameForTracking, activeTrack
 
     spawn_child_infer_server()
 
@@ -221,39 +227,51 @@ def main():
             RUNNING = False
             break
         elif key == ord('r'):
-            # reset child
             ensure_child_is_running()
-            new_mask = send_command_to_child("RESET")
+            send_command_to_child("RESET")
             mask = None
             point = None
+            activeTrack = False
             print("[Main] RESET => mask cleared, no active track.")
-        else:
-            # Optionally, if you want dynamic updates on each new frame:
-            # read the frame, if we have a track, do "UPDATE"
-            # omitted if you only do single-shot init each time
-            pass
 
-        # show image
+        # If we want dynamic tracking => each new frame => "UPDATE"
+        # We'll do that if activeTrack is True
         frameCopy = None
         with latestFrameLock:
             if latestFrame is not None:
                 frameCopy = latestFrame.copy()
                 latestFrame = None
+
         if frameCopy is None and lastFrameForTracking is not None:
             frameCopy = lastFrameForTracking.copy()
 
         if frameCopy is not None:
             lastFrameForTracking = frameCopy.copy()
+
+            # If we have an active track, do an UPDATE for each new frame
+            if activeTrack:
+                ensure_child_is_running()
+                cv2.imwrite("tmp_input.jpg", frameCopy)
+                new_mask = send_command_to_child("UPDATE tmp_input.jpg")
+                if new_mask is not None:
+                    mask = new_mask
+
+            # now do the overlay
             disp = frameCopy.copy()
             if mask is not None:
+                # We'll treat 'mask==255' as object => keep green.
+                # 'mask<128' => background => zero out green => object remains green
                 bin_mask = (mask < 128)
                 green = np.zeros_like(disp)
                 green[:] = (0,185,118)
+                # background => set to black => object remains green
                 green[bin_mask] = 0
+
                 disp = cv2.addWeighted(disp, 0.4, green, 0.6, 0)
 
-                obj_mask = np.logical_not(bin_mask)
+                # Show the mask in white
                 mask_disp = np.zeros_like(disp)
+                obj_mask = np.logical_not(bin_mask)
                 mask_disp[obj_mask] = (255,255,255)
                 cv2.imshow("mask", mask_disp)
             cv2.imshow("image", disp)
