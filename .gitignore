@@ -7,3 +7,4 @@ data
 **.egg-info
 *.onnx
 .hypothesis
+torch2trt/
